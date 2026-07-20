@@ -1011,8 +1011,8 @@ void httpd_appcall(void)
 			}
 		} else {
 			dbg_string("Have entry, authenticated: "); dbg_byte(authenticated); dbg_char('\n');
-			if (!authenticated && !(f_data[entry].start == FDATA_START_login_html 
-						|| f_data[entry].start == FDATA_START_port_svg 
+			if (!authenticated && !(f_data[entry].start == FDATA_START_login_html
+						|| f_data[entry].start == FDATA_START_port_svg
 						|| f_data[entry].start == FDATA_START_sfp_svg
 						|| f_data[entry].start == FDATA_START_i18n_js
 						|| f_data[entry].start == FDATA_START_style_css)) {
