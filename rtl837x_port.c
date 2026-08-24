@@ -746,6 +746,31 @@ uint16_t port_lag_members_get(uint8_t lag) __banked
 }
 
 
+/* Return a stable LACP operational class for a usable link. Zero means that
+ * the port is down or half duplex and therefore must not enter an aggregate.
+ * Values 1..16 correspond to the ASIC's negotiated-speed nibble plus one. */
+uint8_t port_link_class(uint8_t port) __banked
+{
+	reg_read_m(RTL837X_REG_LINKS_STS);
+	if (!(sfr_data[(port >> 3) + 1] & (((uint8_t)1) << (port & 7))))
+		return 0;
+
+	if (!machine.is_sfp[port]) {
+		phy_read(port, PHY_MMD31, PHY_MMD31_PHYSR);
+		if (!(SFR_DATA_U16 & 0x0008))	/* LACP requires full duplex */
+			return 0;
+	}
+
+	if (port < 8)
+		reg_read_m(RTL837X_REG_LINKS);
+	else
+		reg_read_m(RTL837X_REG_LINKS_89);
+	uint8_t state = sfr_data[3 - ((port & 7) >> 1)];
+	state = (port & 1) ? state >> 4 : state & 0x0f;
+	return state + 1;
+}
+
+
 /*
  * Configure LAGs
  * Sets the members via port bitmask of a given Link Aggregation Group

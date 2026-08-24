@@ -205,7 +205,7 @@ uint8_t atoi_byte(__xdata uint8_t *out, uint8_t idx)
 }
 
 
-uint8_t atoi_short(__xdata uint16_t *vlan, uint8_t idx)
+uint8_t atoi_short(__xdata uint16_t *vlan, __xdata uint8_t idx)
 {
 	uint8_t err = 1;
 	*vlan = 0;
@@ -308,10 +308,20 @@ void parse_lag(void)
 		members |= ((uint16_t)1) << port;
 		w++;
 	}
-	if (lacp_mode)
-		lacp_lag_set(group, members);	/* 0 ports also valid: removes the LAG */
-	else
+	if (!members && lacp_mode)
+		goto err;	/* use the explicit "lacp off" form */
+	if (!lacp_ports_available(group, members)) {
+		print_string("Error: a port is already assigned to another LAG\n");
+		return;
+	}
+	if (lacp_mode) {
+		if (!lacp_lag_set(group, members))
+			print_string("Error: unable to configure LACP group\n");
+	} else {
+		if (lacp_lag_ports[group])
+			lacp_lag_set(group, 0);	/* static mode replaces LACP deterministically */
 		port_lag_members_set(group, members);
+	}
 	return;
 err:
 	print_string("Error: lag <1-4> [lacp] [port]...\n");
@@ -1597,17 +1607,24 @@ void cmd_parser(void) __banked
 		} else if (cmd_compare(0, "lacp")) {
 			if (cmd_compare(1, "show"))
 				lacp_show();
+			else if (cmd_compare(1, "on"))
+				lacp_cmd(1);
+			else if (cmd_compare(1, "off"))
+				lacp_cmd(0);
 			else
-				lacp_cmd(cmd_compare(1, "on"));
+				print_string("Error: lacp [show|on|off]\n");
 		} else if (cmd_compare(0, "pvid") && cmd_words_len == 3) {
 			__xdata uint16_t pvid;
 			if (cmd_buffer[cmd_words_b[1]] >= '1'
 			    && cmd_buffer[cmd_words_b[1]] <= '9'
 			    && cmd_buffer[cmd_words_b[1] + 1] <= ' '
-			    && !atoi_short(&pvid, cmd_words_b[2]) && pvid && pvid <= 4094)
+			    && !atoi_short(&pvid, cmd_words_b[2]) && pvid && pvid <= 4094) {
 				port_pvid_set(machine.phys_to_log_port[cmd_buffer[cmd_words_b[1]] - '1'], pvid);
-			else
+				if (lacpEnabled)
+					lacp_fdb_refresh();
+			} else {
 				print_string("Error: pvid <port> <1-4094>\n");
+			}
 		} else if (cmd_compare(0, "vlan")) {
 			parse_vlan();
 		} else if (cmd_compare(0, "isolate")) {

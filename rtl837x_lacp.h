@@ -13,12 +13,14 @@ void lacp_in(void) __banked;
 void lacp_setup(void) __banked;
 void lacp_timers(void) __banked;
 void lacp_off(void) __banked;
+void lacp_fdb_refresh(void) __banked;
 void lacp_cmd(uint8_t on) __banked;	/* "lacp on|off" master engine handler */
 void lacp_show(void) __banked;		/* "lacp show" - per-port state + RX counters */
 /* Assign a candidate-port mask to a LACP-mode LAG (`lag <n> lacp <ports>`).
  * ports == 0 removes the LAG from LACP management. Enables the engine on first
  * LACP LAG and tears it down when the last one goes away. */
-void lacp_lag_set(uint8_t lag, uint16_t ports) __banked;
+uint8_t lacp_lag_set(__xdata uint8_t lag, __xdata uint16_t ports) __banked;
+uint8_t lacp_ports_available(__xdata uint8_t lag, __xdata uint16_t ports) __banked;
 
 /*
  * Per-LAG LACP: each of the 4 hardware trunk groups (0-3) can independently run
@@ -44,6 +46,7 @@ extern __xdata uint16_t lacp_lag_ports[LACP_NUM_LAGS];	/* admin candidate-port m
 extern __xdata uint8_t  lacp_agg_sys[LACP_NUM_LAGS][6];	/* elected partner System per LAG */
 extern __xdata uint8_t  lacp_agg_valid[LACP_NUM_LAGS];	/* aggregator elected for this LAG */
 extern __xdata uint16_t lacp_members_last[LACP_NUM_LAGS];/* trunk members we last programmed per LAG */
+extern __xdata uint8_t  lacp_oper_class[10];		/* 0=down/ineligible, otherwise negotiated link class */
 
 /* Slow-Protocols / LACPDU identifiers (802.3ad 43.4) */
 #define SLOW_PROTO_ETHERTYPE	0x8809
@@ -77,17 +80,12 @@ extern __xdata uint16_t lacp_members_last[LACP_NUM_LAGS];/* trunk members we las
 /* Fully-participating actor: in sync AND collecting AND distributing. */
 #define LACP_STATE_FULL		(LACP_STATE_SYNC | LACP_STATE_COLLECTING | LACP_STATE_DISTRIBUTING)
 
-/*
- * Timer units: one decrement per active lacp_timers() call (~64 Hz: the main
- * loop runs ~256 Hz and LACP_TICK_DIVIDER skips 3 of 4 calls). The values
- * below are the HARDWARE-VERIFIED ones the aggregate converged with; their
- * wall-clock equivalents are ~4x the nominal 802.3ad figures, which only
- * makes us more patient with the partner (and the partner sets the pace of
- * our fast/slow TX via its TIMEOUT bit). Do not "fix" the scale blindly. */
-#define LACP_FAST_PERIODIC	0x0100	/* fast periodic TX   (~4 s wall clock)  */
-#define LACP_SLOW_PERIODIC	0x1e00	/* slow periodic TX  (~120 s wall clock) */
-#define LACP_SHORT_TIMEOUT	0x0300	/* partner dead after (~12 s wall clock) */
-#define LACP_LONG_TIMEOUT	0x5a00	/* partner dead after (~360 s wall clock)*/
+/* Timer units are seconds. lacp_timers() is called exactly once from the
+ * firmware's SYS_TICK_HZ-derived one-second housekeeping path. */
+#define LACP_FAST_PERIODIC	1
+#define LACP_SLOW_PERIODIC	30
+#define LACP_SHORT_TIMEOUT	3
+#define LACP_LONG_TIMEOUT	90
 
 /* Per-port LACP receive-machine state (802.3ad 43.4.12) */
 #define LACP_RX_INITIALIZE	0
