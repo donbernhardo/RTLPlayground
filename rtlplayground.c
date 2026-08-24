@@ -1573,6 +1573,9 @@ void idle(void)
 
 		// Check for button presses once a second
 		handle_button();
+		// LACP constants are in seconds; this path is derived from SYS_TICK_HZ.
+		if (lacpEnabled)
+			lacp_timers();
 
 #ifdef DEBUG
 		print_sfr_data();
@@ -1630,9 +1633,6 @@ void idle(void)
 			stp_clock--;
 		}
 	}
-	// If LACP enabled, drive its machines (own tick divider lives in the banked module)
-	if (lacpEnabled)
-		lacp_timers();
 	// Check whether a command is waiting in the cmd_buffer and execute
 	if (cmd_available) {
 		cmd_available = 0;

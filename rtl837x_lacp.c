@@ -94,10 +94,7 @@ __xdata uint16_t lacp_partner_port_prio[10];	/* partner Port priority         */
 __xdata uint16_t lacp_periodic[10];		/* down-counter to next TX       */
 __xdata uint16_t lacp_timeout[10];		/* down-counter to partner expiry*/
 __xdata uint8_t  lacp_ntt[10];			/* Need-To-Transmit flag         */
-
-/* Tick divider so lacp_timers() may be called on every main-loop tick */
-#define LACP_TICK_DIVIDER 3
-__xdata uint8_t lacp_clock;
+__xdata uint8_t  lacp_oper_class[10];		/* 0=down/ineligible; else speed class */
 
 /* Per-LAG state: the hardware trunk groups run LACP independently. */
 __xdata uint16_t lacp_lag_ports[LACP_NUM_LAGS];
@@ -105,6 +102,8 @@ __xdata uint8_t  lacp_port_lag[10];
 __xdata uint8_t  lacp_agg_sys[LACP_NUM_LAGS][6];
 __xdata uint8_t  lacp_agg_valid[LACP_NUM_LAGS];
 __xdata uint16_t lacp_members_last[LACP_NUM_LAGS];
+__xdata uint16_t lacp_agg_partner_key[LACP_NUM_LAGS];
+__xdata uint16_t lacp_agg_actor_key[LACP_NUM_LAGS];
 
 __xdata uint16_t lacp_scratch_mask;
 __xdata uint8_t  lacp_scratch_flag;
@@ -115,19 +114,18 @@ __xdata uint16_t lacp_rx_count[10];
 
 __xdata uint16_t lacp_fdb_vid;
 __xdata uint8_t  lacp_fdb_i, lacp_fdb_j, lacp_fdb_guard;
+__xdata uint16_t lacp_fdb_active[9];
+__xdata uint8_t  lacp_fdb_active_count;
 
 
 
 void lacp_mux_update(void) __banked;	/* defined below, used from lacp_in */
+static void lacp_port_init(uint8_t port);
+static uint8_t lacp_oper_update(uint8_t port);
 
-/* Compare two six-byte LACP system identifiers. */
-static uint8_t lacp_sys_eq(__xdata uint8_t *a, __xdata uint8_t *b)
+static uint16_t lacp_actor_key(uint8_t port)
 {
-	for (uint8_t i = 0; i < 6; i++) {
-		if (a[i] != b[i])
-			return 0;
-	}
-	return 1;
+	return ((uint16_t)(lacp_port_lag[port] + 1) << 8) | lacp_oper_class[port];
 }
 
 /*
@@ -146,7 +144,14 @@ static uint8_t lacp_port_selected(uint8_t port)
 		return 0;
 	if (!lacp_agg_valid[lag])
 		return 0;
-	return lacp_sys_eq(lacp_partner_sys[port], lacp_agg_sys[lag]);
+	if (!lacp_oper_class[port]
+	    || lacp_actor_key(port) != lacp_agg_actor_key[lag]
+	    || lacp_partner_key[port] != lacp_agg_partner_key[lag])
+		return 0;
+	for (uint8_t i = 0; i < 6; i++)
+		if (lacp_partner_sys[port][i] != lacp_agg_sys[lag][i])
+			return 0;
+	return 1;
 }
 
 
@@ -176,7 +181,7 @@ static uint8_t lacp_mux_machine(uint8_t port)
 	return 1;
 }
 
-#define port_bit(p) (((uint8_t)1) << (p))
+#define port_bit(p) (((uint16_t)1) << (p))
 
 /* All front-panel ports of the detected chip (platform knowledge, one place) */
 #define LACP_PMASK_PORTS (machine_detected.isRTL8373 ? PMASK_9 : PMASK_6)
@@ -215,12 +220,13 @@ void lacp_send(uint8_t port) __banked
 	LACP_O->actor_len = LACP_TLV_LEN_INFO;
 	LACP_O->actor.sys_prio = HTONS(LACP_SYS_PRIO);
 	memcpy(LACP_O->actor.sys, uip_ethaddr.addr, 6);
-	/* Per-LAG Actor Key so a partner never merges ports of our different LAGs
-	 * into one aggregate (only ever called for ports in a LACP LAG). */
-	LACP_O->actor.key = HTONS((uint16_t)(lacp_port_lag[port] + 1));
+	/* The operational key includes the LAG and negotiated link class. Ports at
+	 * different speeds therefore cannot be selected into one remote aggregate. */
+	LACP_O->actor.key = HTONS(lacp_actor_key(port));
 	LACP_O->actor.port_prio = HTONS(LACP_DEF_PORT_PRIO);
 	LACP_O->actor.port = HTONS((uint16_t)port + 1);	/* 1-based port id */
 	LACP_O->actor.state = lacp_actor_state[port];
+	memset(LACP_O->actor.reserved, 0, sizeof(LACP_O->actor.reserved));
 
 	/* Partner TLV: echo the last partner info we recorded, VERBATIM. A Linux
 	 * 802.3ad partner (__record_pdu) only accepts the SYNC bit we set above if
@@ -236,13 +242,16 @@ void lacp_send(uint8_t port) __banked
 	LACP_O->partner.port_prio = HTONS(lacp_partner_port_prio[port]);
 	LACP_O->partner.port = HTONS(lacp_partner_port[port]);
 	LACP_O->partner.state = lacp_partner_state[port];
+	memset(LACP_O->partner.reserved, 0, sizeof(LACP_O->partner.reserved));
 
 	/* Collector TLV + Terminator */
 	LACP_O->tlv_collector = LACP_TLV_COLLECTOR;
 	LACP_O->collector_len = LACP_TLV_LEN_COLLECTOR;
 	LACP_O->collector_max_delay = 0;
+	memset(LACP_O->collector_reserved, 0, sizeof(LACP_O->collector_reserved));
 	LACP_O->tlv_terminator = LACP_TLV_TERMINATOR;
 	LACP_O->terminator_len = 0x00;
+	memset(LACP_O->terminator_reserved, 0, sizeof(LACP_O->terminator_reserved));
 
 	lacp_ntt[port] = 0;
 	/* Slow-protocol frames are link-local and must egress untagged. With a
@@ -268,21 +277,35 @@ void lacp_send(uint8_t port) __banked
  */
 void lacp_in(void) __banked
 {
+	uint16_t frame_len = uip_len;
 	uip_len = 0;
 
-	if (LACP_I->subtype != SLOW_PROTO_SUBTYPE_LACP)
+	/* Reject before dereferencing TLVs. RX includes the RTL and VLAN tags. */
+	if (frame_len < sizeof(struct lacpdu_in)
+	    || LACP_I->dst[0] != 0x01 || LACP_I->dst[1] != 0x80
+	    || LACP_I->dst[2] != 0xc2 || LACP_I->dst[3] != 0x00
+	    || LACP_I->dst[4] != 0x00 || LACP_I->dst[5] != LACP_DST5
+	    || LACP_I->ethertype != HTONS(SLOW_PROTO_ETHERTYPE)
+	    || LACP_I->subtype != SLOW_PROTO_SUBTYPE_LACP
+	    || LACP_I->version != LACP_VERSION
+	    || LACP_I->tlv_actor != LACP_TLV_ACTOR
+	    || LACP_I->actor_len != LACP_TLV_LEN_INFO
+	    || LACP_I->tlv_partner != LACP_TLV_PARTNER
+	    || LACP_I->partner_len != LACP_TLV_LEN_INFO)
 		return;
 
 	/* Per rtl837x_common.h, pmask carries a 4-bit port number on RX
 	 * (hardware-verified on RTL8373: per-port rx counters track the actual
 	 * ingress port through full LACP convergence). */
-	uint8_t port = ((uint8_t)HTONS(LACP_I->rtl_tag.pmask)) & 0x0f;
+	__xdata uint8_t port = ((uint8_t)HTONS(LACP_I->rtl_tag.pmask)) & 0x0f;
 	if (port < machine.min_port || port > machine.max_port)
 		return;
 
 	/* Only ports assigned to a LACP-mode LAG participate in the protocol. */
 	uint8_t lag = lacp_port_lag[port];
 	if (lag == LACP_LAG_NONE)
+		return;
+	if (!lacp_oper_update(port))
 		return;
 
 
@@ -303,12 +326,17 @@ void lacp_in(void) __banked
 
 	/* Receive machine -> CURRENT, (re)arm partner timeout (43.4.12) */
 	lacp_rx_state[port] = LACP_RX_CURRENT;
-	lacp_timeout[port] = (LACP_I->actor.state & LACP_STATE_TIMEOUT)
+	/* Receive timeout follows our advertised preference; the peer's TIMEOUT bit
+	 * controls how often it wants us to transmit, not how long we wait for it. */
+	lacp_timeout[port] = (lacp_actor_state[port] & LACP_STATE_TIMEOUT)
 	                   ? LACP_SHORT_TIMEOUT : LACP_LONG_TIMEOUT;
 
 	/* Elect this LAG's aggregator partner system on first contact (43.4.14) */
-	if (!lacp_agg_valid[lag]) {
+	if (!lacp_agg_valid[lag]
+	    && (LACP_I->actor.state & LACP_STATE_AGGREGATION)) {
 		memcpy(lacp_agg_sys[lag], LACP_I->actor.sys, 6);
+		lacp_agg_partner_key[lag] = HTONS(LACP_I->actor.key);
+		lacp_agg_actor_key[lag] = lacp_actor_key(port);
 		lacp_agg_valid[lag] = 1;
 	}
 
@@ -318,8 +346,17 @@ void lacp_in(void) __banked
 
 	/* update_NTT (43.4.12): if the partner's view of us is stale (their
 	 * Partner block does not match our actor state/port), tell them again. */
+	lacp_scratch_flag = 0;
+	for (uint8_t i = 0; i < 6; i++)
+		if (LACP_I->partner.sys[i] != uip_ethaddr.addr[i])
+			lacp_scratch_flag = 1;
 	if (LACP_I->partner.state != lacp_actor_state[port]
+	    || HTONS(LACP_I->partner.sys_prio) != LACP_SYS_PRIO
+	    || HTONS(LACP_I->partner.key) != lacp_actor_key(port)
+	    || HTONS(LACP_I->partner.port_prio) != LACP_DEF_PORT_PRIO
 	    || HTONS(LACP_I->partner.port) != (uint16_t)port + 1)
+		lacp_scratch_flag = 1;
+	if (lacp_scratch_flag)
 		lacp_ntt[port] = 1;
 
 	lacp_mux_update();
@@ -333,7 +370,7 @@ void lacp_in(void) __banked
 
 /* Write the static Slow-Protocols L2 MC entry for VID `lacp_fdb_vid` with a
  * CPU-only member mask. */
-static void lacp_fdb_set(void)
+static void lacp_fdb_write(uint8_t valid)
 {
 	lacp_fdb_guard = 0;
 	do {	/* wait out any previous table op (bounded, cf. the IGMP guards) */
@@ -341,8 +378,8 @@ static void lacp_fdb_set(void)
 	} while ((sfr_data[3] & TBL_EXECUTE) && ++lacp_fdb_guard);
 
 	REG_WRITE(RTL837x_TBL_DATA_IN_A, 0xc2, 0x00, 0x00, 0x02);
-	REG_WRITE(RTL837x_TBL_DATA_IN_B, 0x20 | (lacp_fdb_vid >> 8), lacp_fdb_vid, 0x01, 0x80);
-	REG_WRITE(RTL837x_TBL_DATA_IN_C, 0, 0, 0, PMASK_CPU >> 2);
+	REG_WRITE(RTL837x_TBL_DATA_IN_B, (valid ? 0x20 : 0) | (lacp_fdb_vid >> 8), lacp_fdb_vid, 0x01, 0x80);
+	REG_WRITE(RTL837x_TBL_DATA_IN_C, 0, 0, 0, valid ? PMASK_CPU >> 2 : 0);
 	REG_WRITE(RTL837X_TBL_CTRL, 0, 0, TBL_L2_UNICAST, TBL_WRITE | TBL_EXECUTE);
 	lacp_fdb_guard = 0;
 	do {
@@ -352,8 +389,16 @@ static void lacp_fdb_set(void)
 
 /* Refresh the CPU-steering entries after a LACP topology change: one entry
  * per distinct PVID over all LACP candidate ports. Config-time only. */
-static void lacp_fdb_update(void)
+void lacp_fdb_refresh(void) __banked
 {
+	/* Delete only entries previously installed by this module, then rebuild the
+	 * small desired set. This also handles PVID changes without an off/on cycle. */
+	for (lacp_fdb_i = 0; lacp_fdb_i < lacp_fdb_active_count; lacp_fdb_i++) {
+		lacp_fdb_vid = lacp_fdb_active[lacp_fdb_i];
+		lacp_fdb_write(0);
+	}
+	lacp_fdb_active_count = 0;
+
 	for (lacp_fdb_i = machine.min_port; lacp_fdb_i <= machine.max_port; lacp_fdb_i++) {
 		if (lacp_port_lag[lacp_fdb_i] == LACP_LAG_NONE)
 			continue;
@@ -363,7 +408,9 @@ static void lacp_fdb_update(void)
 			    && port_pvid_get(lacp_fdb_j) == lacp_fdb_vid)
 				goto next_port;		/* this PVID is already written */
 		}
-		lacp_fdb_set();
+		lacp_fdb_write(1);
+		if (lacp_fdb_active_count < 9)
+			lacp_fdb_active[lacp_fdb_active_count++] = lacp_fdb_vid;
 next_port:	;
 	}
 }
@@ -397,21 +444,16 @@ void lacp_mux_update(void) __banked
 
 void lacp_timers(void) __banked
 {
-	if (lacp_clock) {			/* only act every LACP_TICK_DIVIDER ticks */
-		lacp_clock--;
-		return;
-	}
-	lacp_clock = LACP_TICK_DIVIDER;
-
 	for (uint8_t i = machine.min_port; i <= machine.max_port; i++) {
 		if (lacp_port_lag[i] == LACP_LAG_NONE)	/* not in a LACP LAG */
 			continue;
+		if (!lacp_oper_update(i))		/* down or half duplex */
+			continue;
 
 		/* Periodic transmit machine (802.3ad 43.4.13) */
-		if (lacp_periodic[i]) {
-			lacp_periodic[i]--;
-		} else {
-			lacp_periodic[i] = (lacp_partner_state[i] & LACP_STATE_TIMEOUT)
+		if (!lacp_periodic[i] || !--lacp_periodic[i]) {
+			lacp_periodic[i] = (lacp_rx_state[i] != LACP_RX_CURRENT
+			                    || (lacp_partner_state[i] & LACP_STATE_TIMEOUT))
 			                 ? LACP_FAST_PERIODIC : LACP_SLOW_PERIODIC;
 			lacp_ntt[i] = 1;
 		}
@@ -444,8 +486,11 @@ void lacp_timers(void) __banked
 				break;
 			}
 		}
-		if (!any_current)
+		if (!any_current) {
 			lacp_agg_valid[lag] = 0;
+			lacp_agg_partner_key[lag] = 0;
+			lacp_agg_actor_key[lag] = 0;
+		}
 	}
 
 	lacp_mux_update();
@@ -455,17 +500,32 @@ void lacp_timers(void) __banked
 /* Bring one port up as an active-fast LACP participant (43.4.12 init). */
 static void lacp_port_init(uint8_t port)
 {
-	lacp_actor_state[port] = LACP_STATE_ACTIVITY | LACP_STATE_AGGREGATION
-	                       | LACP_STATE_TIMEOUT;	/* active + fast */
-	lacp_rx_state[port] = LACP_RX_INITIALIZE;
+	lacp_oper_class[port] = port_link_class(port);
+	lacp_actor_state[port] = lacp_oper_class[port]
+	                       ? LACP_STATE_ACTIVITY | LACP_STATE_AGGREGATION | LACP_STATE_TIMEOUT
+	                       : 0;
+	lacp_rx_state[port] = lacp_oper_class[port] ? LACP_RX_INITIALIZE : LACP_RX_PORT_DISABLED;
 	lacp_partner_state[port] = LACP_STATE_DEFAULTED;
 	memset(lacp_partner_sys[port], 0, 6);
 	lacp_partner_key[port] = 0;
 	lacp_partner_port[port] = 0;
 	lacp_periodic[port] = LACP_FAST_PERIODIC;
 	lacp_timeout[port] = 0;
-	lacp_ntt[port] = 1;	/* announce ourselves immediately */
+	lacp_ntt[port] = !!lacp_oper_class[port];	/* announce on usable links */
 	lacp_rx_count[port] = 0;
+}
+
+/* Reinitialize the participant when link state, speed or duplex eligibility
+ * changes. The RX counter is diagnostic lifetime state and is preserved. */
+static uint8_t lacp_oper_update(uint8_t port)
+{
+	uint8_t current = port_link_class(port);
+	if (current == lacp_oper_class[port])
+		return !!current;
+	uint16_t rx_count = lacp_rx_count[port];
+	lacp_port_init(port);
+	lacp_rx_count[port] = rx_count;
+	return !!lacp_oper_class[port];
 }
 
 /* Return a port to non-LACP state. (Port isolation is no longer touched -
@@ -473,6 +533,8 @@ static void lacp_port_init(uint8_t port)
 static void lacp_port_release(uint8_t port)
 {
 	lacp_actor_state[port] = 0;
+	lacp_rx_state[port] = LACP_RX_PORT_DISABLED;
+	lacp_oper_class[port] = 0;
 	lacp_ntt[port] = 0;
 }
 
@@ -490,7 +552,6 @@ static uint8_t lacp_any_lag(void)
  */
 static void lacp_engine_on(void)
 {
-	lacp_clock = LACP_TICK_DIVIDER;
 	lacpEnabled = 1;
 	REG_SET(RTL837X_RMA2_CONF, RTL837X_RMA_ACT_FORWARD);
 }
@@ -512,14 +573,36 @@ void lacp_init(void) __banked
 	for (uint8_t i = 0; i < 10; i++) {
 		lacp_port_lag[i] = LACP_LAG_NONE;
 		lacp_actor_state[i] = 0;
+		lacp_rx_state[i] = LACP_RX_PORT_DISABLED;
+		lacp_oper_class[i] = 0;
 		lacp_ntt[i] = 0;
 	}
 	for (uint8_t l = 0; l < LACP_NUM_LAGS; l++) {
 		lacp_lag_ports[l] = 0;
 		lacp_agg_valid[l] = 0;
+		lacp_agg_partner_key[l] = 0;
+		lacp_agg_actor_key[l] = 0;
 		lacp_members_last[l] = 0;
 	}
+	lacp_fdb_active_count = 0;
 	lacpEnabled = 0;
+}
+
+/* A physical port has one aggregation owner. Check both administrative LACP
+ * candidates and static hardware groups, excluding the group being edited. */
+uint8_t lacp_ports_available(__xdata uint8_t lag, __xdata uint16_t ports) __banked
+{
+	if (lag >= LACP_NUM_LAGS || (ports & ~LACP_PMASK_PORTS))
+		return 0;
+	for (uint8_t other = 0; other < LACP_NUM_LAGS; other++) {
+		if (other == lag)
+			continue;
+		if (ports & lacp_lag_ports[other])
+			return 0;
+		if (ports & port_lag_members_get(other))
+			return 0;
+	}
+	return 1;
 }
 
 /*
@@ -529,11 +612,15 @@ void lacp_init(void) __banked
  * The engine's RMA trap is enabled on the first LACP LAG and torn down with the
  * last. Never wipes a static "lag" the user configured on a different group.
  */
-void lacp_lag_set(uint8_t lag, uint16_t ports) __banked
+uint8_t lacp_lag_set(__xdata uint8_t lag, __xdata uint16_t ports) __banked
 {
 	if (lag >= LACP_NUM_LAGS)
-		return;
+		return 0;
+	if (ports && !lacp_ports_available(lag, ports))
+		return 0;
 	lacp_scratch_flag = lacp_any_lag();
+	if (ports)
+		port_lag_members_set(lag, 0);	/* replace any static configuration */
 
 	/* Drop ports that were in this LAG but are not in the new mask. */
 	for (uint8_t i = machine.min_port; i <= machine.max_port; i++) {
@@ -548,6 +635,8 @@ void lacp_lag_set(uint8_t lag, uint16_t ports) __banked
 		port_lag_members_set(lag, 0);
 	}
 	lacp_agg_valid[lag] = 0;
+	lacp_agg_partner_key[lag] = 0;
+	lacp_agg_actor_key[lag] = 0;
 	lacp_lag_ports[lag] = ports;
 
 	if (ports && !lacp_scratch_flag)	/* first LACP LAG: bring the engine up first */
@@ -564,7 +653,11 @@ void lacp_lag_set(uint8_t lag, uint16_t ports) __banked
 	if (!lacp_any_lag() && lacp_scratch_flag)	/* removed the last LACP LAG */
 		lacp_engine_off();
 
-	lacp_fdb_update();	/* (re)write the CPU-steering entries for the new topology */
+	lacp_fdb_refresh();	/* rebuild CPU-steering entries for the new topology */
+	for (uint8_t i = machine.min_port; i <= machine.max_port; i++)
+		if (lacp_port_lag[i] == lag && lacp_ntt[i] && lacp_oper_class[i])
+			lacp_send(i);	/* active mode announces immediately */
+	return 1;
 }
 
 
@@ -625,8 +718,10 @@ void lacp_cmd(uint8_t on) __banked
 {
 	/* lacpEnabled is owned by lacp_engine_on()/off(), driven from lacp_lag_set() */
 	if (on) {
-		print_string("LACP enabled\n");
-		lacp_setup();
+		if (lacp_lag_set(0, LACP_PMASK_PORTS))
+			print_string("LACP enabled\n");
+		else
+			print_string("LACP not enabled: a port belongs to another LAG\n");
 	} else {
 		print_string("LACP disabled\n");
 		lacp_off();

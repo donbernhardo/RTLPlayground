@@ -697,6 +697,8 @@ void send_lacp(void)
 		byte_to_html(lacp_partner_state[i]);
 		slen += strtox(outbuf + slen, "\",\"rs\":");
 		itoa_html(lacp_rx_state[i]);
+		slen += strtox(outbuf + slen, ",\"oc\":");
+		itoa_html(lacp_oper_class[i]);
 		/* rx as 4-digit hex: itoa16_html() only renders values up to 9999
 		 * correctly (see its VLAN-ID comment), the counter goes to 65535 */
 		slen += strtox(outbuf + slen, ",\"rx\":\"");

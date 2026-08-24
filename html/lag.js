@@ -1,4 +1,15 @@
 var lagInterval = Number();
+var lagHwMembers = [0, 0, 0, 0];
+
+function lagGroupNumber(index) { return index + 1; }
+function lagCommand(index, lacpMode, ports) {
+  return "lag " + lagGroupNumber(index) + (lacpMode ? " lacp" : "")
+    + (ports.length ? " " + ports.join(" ") : "");
+}
+function lagOffCommand(index) { return "lag " + lagGroupNumber(index) + " lacp off"; }
+function lagHashCommand(index, preset) {
+  return "laghash " + lagGroupNumber(index) + " " + preset.kw;
+}
 
 // Trunk load-balancing hash presets. `bits` matches the LAG_HASH_* register
 // value (see rtl837x_regs.h); `kw` are the "laghash" CLI keywords. A hardware
@@ -82,6 +93,32 @@ function setL(p, c){
 // the live trunk members - those converge over time and are shown in lagStatN.
 var lacpCfg = [0, 0, 0, 0];
 
+function logicalPortBit(physicalPort) {
+  let logical = physicalPort - 1;
+  if (numPorts < 9)
+    logical = physToLogPort[logical];
+  return 1 << logical;
+}
+
+function updatePortConflicts() {
+  if (!numPorts) return;
+  for (let l = 0; l < 4; l++) {
+    for (let p = 1; p <= numPorts; p++) {
+      const input = document.getElementById("p_mLAG" + l + "_" + p);
+      if (!input) continue;
+      const bit = logicalPortBit(p);
+      let owner = 0;
+      for (let other = 0; other < 4; other++) {
+        if (other === l) continue;
+        const members = lacpCfg[other] || lagHwMembers[other];
+        if (members & bit) owner = other + 1;
+      }
+      input.disabled = owner !== 0;
+      input.title = owner ? ("Port is already assigned to LAG " + owner) : "";
+    }
+  }
+}
+
 function fetchLag() {
   var xhttp = new XMLHttpRequest();
   xhttp.onreadystatechange = function() {
@@ -92,7 +129,8 @@ function fetchLag() {
         if (lagDirty[l])          // user is editing this LAG - do not revert
           continue;
         // LACP-managed LAG: checkboxes reflect lacpCfg (set by fetchLacp)
-        let members = lacpCfg[l] ? lacpCfg[l] : parseInt(s[l].members, 2);
+        lagHwMembers[l] = parseInt(s[l].members, 2);
+        let members = lacpCfg[l] ? lacpCfg[l] : lagHwMembers[l];
         let hash = parseInt(s[l].hash, 16);
         for (let i = 1; i <= numPorts; i++) {
           let p = i - 1;
@@ -116,32 +154,44 @@ function fetchLag() {
           sel.value = idx;
         }
       }
+      updatePortConflicts();
     }
   };
   xhttp.open("GET", `/lag.json`, true);
   sendXHTTP(xhttp);
 }
 async function lagSub(l) {
-  var cmd = "lag " + l;
   const lacpMode = document.getElementById("mode" + l).value === "lacp";
-  if (lacpMode)
-    cmd = cmd + " lacp";
-  else if (lacpCfg[l])
+  const ports = [];
+  const speeds = [];
+  for (let i = 1; i <= numPorts; i++) {
+    if (document.getElementById("p_mLAG"+l+"_"+i).checked) {
+      ports.push(i);
+      const logical = numPorts < 9 ? physToLogPort[i - 1] : i - 1;
+      if (pState[logical] > 0) speeds.push(pState[logical]);
+    }
+  }
+  if (lacpMode && !ports.length) {
+    alert("Select at least one candidate port, or switch the group to Static to remove it.");
+    return;
+  }
+  if (lacpMode && new Set(speeds).size > 1) {
+    alert("Active LACP links must negotiate the same speed.");
+    return;
+  }
+  const cmd = lagCommand(l, lacpMode, ports);
+  if (!lacpMode && lacpCfg[l])
     // switched from LACP to Static: release it from LACP first; the static
     // member set (possibly empty) is programmed right after.
-    await fetch('/cmd', { method: 'POST', body: "lag " + l + " lacp off" })
+    await fetch('/cmd', { method: 'POST', body: lagOffCommand(l) })
       .catch(err => console.error(`Error: ${err}`));
-  for (let i = 1; i <= numPorts; i++) {
-    if (document.getElementById("p_mLAG"+l+"_"+i).checked)
-      cmd = cmd + ` ${i}`;
-  }
   try {
     await fetch('/cmd', { method: 'POST', body: cmd });
     // Apply the load-balancing hash from the dropdown (skip a "Custom" entry -
     // it just reflects an out-of-band value and has no keywords to send).
     const sel = document.getElementById("hsel" + l);
     if (sel.value !== "c") {
-      const hcmd = "laghash " + l + " " + HASH_PRESETS[Number(sel.value)].kw;
+      const hcmd = lagHashCommand(l, HASH_PRESETS[Number(sel.value)]);
       await fetch('/cmd', { method: 'POST', body: hcmd });
       console.log('Completed!', cmd, '/', hcmd);
     } else {
@@ -175,15 +225,17 @@ function fetchLacp() {
       }
       let t = "";
       if (s.on) {
-        t = "port  lag   actor  partner  rxstate  rx-count  partner-system\n";
+        t = "port  lag   link-class  actor  partner  rxstate  rx-count  partner-system\n";
         for (const p of s.ports) {
           if (p.lag == 255) continue;     // not part of any LACP LAG
-          t += String(p.p).padEnd(6) + String(p.lag + 1).padEnd(6)
+          t += String(p.p).padEnd(6) + String(p.lag + 1).padEnd(6) + String(p.oc).padEnd(12)
              + p.a.padEnd(7) + p.pt.padEnd(9)
              + String(p.rs).padEnd(9) + String(parseInt(p.rx, 16)).padEnd(10) + p.psys + "\n";
         }
       }
       document.getElementById("lacpPorts").textContent = t;
+      updatePortConflicts();
+      fetchLag();
     }
   };
   xhttp.open("GET", `/lacp.json`, true);
