@@ -49,6 +49,11 @@ void port_lag_members_set(uint8_t lag, uint16_t members)
 	hw_set_calls++;
 }
 
+uint16_t port_lag_members_get(uint8_t lag)
+{
+	return lag < 4 ? hw_members_lag[lag] : 0;
+}
+
 /* 6-byte compare shared with the STP module on target */
 signed char cmpMAC(uint8_t *m1, uint8_t *m2)
 {
@@ -69,9 +74,15 @@ void port_isolate(uint8_t port, uint16_t pmask)
 /* PVID mock: ports carry distinct PVIDs unless a test says otherwise, so
  * lacp_fdb_update's "this PVID is already written" skip is exercised. */
 static uint16_t hw_pvid[10] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+static uint8_t hw_link_class[10] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
 uint16_t port_pvid_get(uint8_t port)
 {
 	return port < 10 ? hw_pvid[port] : 1;
+}
+
+uint8_t port_link_class(uint8_t port)
+{
+	return port < 10 ? hw_link_class[port] : 0;
 }
 
 /* Register-write mock: record the last value per register plus how many
@@ -174,42 +185,54 @@ void tcpip_output(void)
 /* Deliver a LACPDU into the switch on `port`, from partner system `sys`.
  * pstate = partner's Actor_State flags. If `echo`, the partner echoes the
  * switch's last-seen actor block back (fresh view) - required for quiescence. */
-static void partner_frame(uint8_t port, const uint8_t sys[6], uint8_t pstate, int echo)
+static void partner_pdu(struct wire_pdu_in *in, uint8_t port,
+			const uint8_t sys[6], uint8_t pstate, int echo)
 {
-	struct wire_pdu_in in;
-	memset(&in, 0, sizeof(in));
+	memset(in, 0, sizeof(*in));
 
-	in.dst[0]=0x01; in.dst[1]=0x80; in.dst[2]=0xc2; in.dst[5]=0x02;
-	memcpy(in.src, sys, 6);
-	in.rtl_tag.tag = HTONS(RTL_FRAME_TAG_ID);
-	in.rtl_tag.pmask = HTONS(port);		/* RX: 4-bit ingress port */
-	in.ethertype = HTONS(0x8809);
-	in.subtype = 0x01;
-	in.version = 0x01;
+	in->dst[0]=0x01; in->dst[1]=0x80; in->dst[2]=0xc2; in->dst[5]=0x02;
+	memcpy(in->src, sys, 6);
+	in->rtl_tag.tag = HTONS(RTL_FRAME_TAG_ID);
+	in->rtl_tag.pmask = HTONS(port);		/* RX: 4-bit ingress port */
+	in->ethertype = HTONS(0x8809);
+	in->subtype = 0x01;
+	in->version = 0x01;
 
-	in.tlv_actor = 0x01; in.actor_len = 0x14;
-	in.actor.sys_prio = HTONS(0x8000);
-	memcpy(in.actor.sys, sys, 6);
-	in.actor.key = HTONS(0x0011);
-	in.actor.port_prio = HTONS(0x00ff);
-	in.actor.port = HTONS((uint16_t)port + 101);
-	in.actor.state = pstate;
+	in->tlv_actor = 0x01; in->actor_len = 0x14;
+	in->actor.sys_prio = HTONS(0x8000);
+	memcpy(in->actor.sys, sys, 6);
+	in->actor.key = HTONS(0x0011);
+	in->actor.port_prio = HTONS(0x00ff);
+	in->actor.port = HTONS((uint16_t)port + 101);
+	in->actor.state = pstate;
 
-	in.tlv_partner = 0x02; in.partner_len = 0x14;
+	in->tlv_partner = 0x02; in->partner_len = 0x14;
 	if (echo) {			/* fresh view of us, from our last TX */
-		in.partner.sys_prio = last_tx[port].actor.sys_prio;
-		memcpy(in.partner.sys, last_tx[port].actor.sys, 6);
-		in.partner.key = last_tx[port].actor.key;
-		in.partner.port = last_tx[port].actor.port;
-		in.partner.state = last_tx[port].actor.state;
+		in->partner.sys_prio = last_tx[port].actor.sys_prio;
+		memcpy(in->partner.sys, last_tx[port].actor.sys, 6);
+		in->partner.key = last_tx[port].actor.key;
+		in->partner.port_prio = last_tx[port].actor.port_prio;
+		in->partner.port = last_tx[port].actor.port;
+		in->partner.state = last_tx[port].actor.state;
 	}				/* else: zeros = stale view */
+}
 
-	memcpy(uip_buf, &in, sizeof(in));
+static void partner_deliver(struct wire_pdu_in *in, uint16_t len)
+{
+	memcpy(uip_buf, in, sizeof(*in));
+	uip_len = len;
 	lacp_in();
 }
 
-/* Advance time: each lacp_timers() call is one main-loop tick */
-static void ticks(int n) { while (n--) lacp_timers(); }
+static void partner_frame(uint8_t port, const uint8_t sys[6], uint8_t pstate, int echo)
+{
+	struct wire_pdu_in in;
+	partner_pdu(&in, port, sys, pstate, echo);
+	partner_deliver(&in, sizeof(in));
+}
+
+/* Advance protocol time in seconds (firmware calls this from its 1 Hz path). */
+static void seconds(int n) { while (n--) lacp_timers(); }
 
 /* ---------- scenario runner ---------- */
 
@@ -244,7 +267,7 @@ int main(int argc, char **argv)
 
 	/* T1: enable announces on every port with sane field contents */
 	lacp_cmd(1);
-	ticks(8);
+	seconds(1);
 	int all_tx = 1, sane = 1;
 	for (int i = machine.min_port; i <= machine.max_port; i++) {
 		if (!tx_count[i]) all_tx = 0;
@@ -258,7 +281,7 @@ int main(int argc, char **argv)
 	/* T2: partner without SYNC -> actor SYNC only, no members yet */
 	partner_frame(0, SYS_A, P_ACT|P_AGG|P_TO, 1);
 	partner_frame(1, SYS_A, P_ACT|P_AGG|P_TO, 1);
-	ticks(8);
+	seconds(1);
 	CHECK((lacp_actor_state[0] & P_SYNC) && !(lacp_actor_state[0] & (P_COL|P_DIST))
 	      && hw_members == 0,
 	      "T2 partner not in sync: actor SYNC only, trunk empty");
@@ -266,7 +289,7 @@ int main(int argc, char **argv)
 	/* T3: partner in sync on ports 0,1 -> full converge, members 0x0003 */
 	partner_frame(0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
 	partner_frame(1, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
-	ticks(8);
+	seconds(1);
 	CHECK(hw_members == 0x0003
 	      && (lacp_actor_state[0] & (P_SYNC|P_COL|P_DIST)) == (P_SYNC|P_COL|P_DIST)
 	      && (lacp_actor_state[1] & (P_SYNC|P_COL|P_DIST)) == (P_SYNC|P_COL|P_DIST),
@@ -285,7 +308,7 @@ int main(int argc, char **argv)
 
 	/* T4: mis-cabling - port 2 sees a DIFFERENT system: must stay out */
 	partner_frame(2, SYS_B, P_ACT|P_AGG|P_TO|P_SYNC, 1);
-	ticks(8);
+	seconds(1);
 	CHECK(hw_members == 0x0003 && !(lacp_actor_state[2] & P_SYNC),
 	      "T4 mis-cabling: port with different partner system stays out");
 
@@ -293,28 +316,28 @@ int main(int argc, char **argv)
 	int calls_before = hw_set_calls;
 	partner_frame(0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
 	partner_frame(1, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
-	ticks(64);
+	seconds(2);
 	CHECK(hw_set_calls == calls_before,
 	      "T5 stable state: no redundant trunk register writes");
 
 	/* T6: stale echo triggers retransmit (update_NTT) */
 	int txc = tx_count[0];
 	partner_frame(0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 0 /* stale view of us */);
-	ticks(8);
+	seconds(1);
 	CHECK(tx_count[0] > txc, "T6 update_NTT: stale partner view causes retransmit");
 
 	/* T7: expiry - partner silent past the short timeout: trunk drains,
 	 * aggregator identity is released */
-	ticks(4 * 0x0300 + 64);		/* > LACP_SHORT_TIMEOUT work-ticks */
+	seconds(LACP_SHORT_TIMEOUT);
 	CHECK(hw_members == 0 && lacp_agg_valid[0] == 0,
 	      "T7 expiry: members drop to 0 and aggregator is released");
 
 	/* T8: re-convergence with a NEW partner system after release */
 	/* (needs a fresh announce first so the echo below carries current state) */
-	ticks(4 * 0x0100 + 8);		/* let periodic TX refresh last_tx */
+	seconds(LACP_FAST_PERIODIC);	/* let periodic TX refresh last_tx */
 	partner_frame(3, SYS_B, P_ACT|P_AGG|P_TO|P_SYNC, 1);
 	partner_frame(3, SYS_B, P_ACT|P_AGG|P_TO|P_SYNC, 1);
-	ticks(8);
+	seconds(1);
 	CHECK(hw_members == 0x0008 && (lacp_actor_state[3] & P_COL),
 	      "T8 re-election: new partner system forms a fresh aggregate");
 
@@ -329,11 +352,11 @@ int main(int argc, char **argv)
 	 * hardware trunk, and the engine reports enabled. */
 	lacp_lag_set(1, 0x0003);	/* ports 0,1 */
 	lacp_lag_set(2, 0x000c);	/* ports 2,3 */
-	ticks(8);			/* announce */
+	seconds(1);			/* announce */
 	for (int r = 0; r < 2; r++) {	/* two rounds so echoes carry fresh state */
 		for (int p = 0; p < 4; p++)
 			partner_frame(p, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
-		ticks(8);
+		seconds(1);
 	}
 	CHECK(lacpEnabled == 1
 	      && hw_members_lag[1] == 0x0003 && hw_members_lag[2] == 0x000c,
@@ -348,7 +371,7 @@ int main(int argc, char **argv)
 	/* T12: a port in no LACP LAG ignores LACPDUs entirely */
 	int rx5_before = tx_count[5];
 	partner_frame(5, SYS_B, P_ACT|P_AGG|P_TO|P_SYNC, 1);
-	ticks(8);
+	seconds(1);
 	CHECK(!(lacp_actor_state[5] & P_SYNC) && hw_members_lag[2] == 0x000c,
 	      "T12 unassigned port: LACPDU ignored, no state change");
 	(void)rx5_before;
@@ -387,6 +410,83 @@ int main(int argc, char **argv)
 	hw_pvid[1] = 20;
 	lacp_lag_set(0, 0x0003);
 	CHECK(hw_tbl_ops == 2, "T15 two PVIDs among members: one entry per VLAN");
+
+	/* T16: malformed slow-protocol frames must be rejected before any state is
+	 * touched. Exercise the fields a real RX dispatcher cannot safely assume. */
+	struct wire_pdu_in bad;
+	uint16_t rx_before = lacp_rx_count[0];
+	partner_pdu(&bad, 0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+	bad.ethertype = HTONS(0x0800); partner_deliver(&bad, sizeof(bad));
+	partner_pdu(&bad, 0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+	bad.version = 2; partner_deliver(&bad, sizeof(bad));
+	partner_pdu(&bad, 0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+	bad.actor_len = 19; partner_deliver(&bad, sizeof(bad));
+	partner_pdu(&bad, 0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+	partner_deliver(&bad, sizeof(bad) - 1);
+	CHECK(lacp_rx_count[0] == rx_before,
+	      "T16 validation: wrong EtherType/version/TLV and truncated frames rejected");
+
+	/* T17: a physical link has one aggregation owner, for LACP and static LAGs. */
+	CHECK(!lacp_lag_set(1, 0x0002) && lacp_lag_ports[1] == 0,
+	      "T17a ownership: overlapping LACP candidate rejected");
+	port_lag_members_set(1, 0x0004);
+	CHECK(!lacp_lag_set(2, 0x0004) && lacp_lag_ports[2] == 0,
+	      "T17b ownership: overlap with static LAG rejected");
+	port_lag_members_set(1, 0);
+
+	/* T18: same partner system but a different partner key is a different
+	 * aggregator and must not be admitted (UniFi sends one key per aggregate). */
+	partner_frame(0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+	partner_pdu(&bad, 1, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+	bad.actor.key = HTONS(0x0022);
+	partner_deliver(&bad, sizeof(bad));
+	seconds(1);
+	CHECK(hw_members_lag[0] == 0x0001 && !(lacp_actor_state[1] & P_SYNC),
+	      "T18 partner key: mismatched UniFi aggregator key stays out");
+
+	/* T19: equal-speed ports converge; a speed change changes the actor key and
+	 * drains only that member. Link loss then drains the remaining member. */
+	lacp_lag_set(0, 0);
+	hw_link_class[0] = hw_link_class[1] = 3;
+	lacp_lag_set(0, 0x0003);
+	for (int r = 0; r < 2; r++) {
+		partner_frame(0, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+		partner_frame(1, SYS_A, P_ACT|P_AGG|P_TO|P_SYNC, 1);
+		seconds(1);
+	}
+	int converged_equal_speed = hw_members_lag[0] == 0x0003;
+	hw_link_class[1] = 4;
+	seconds(1);
+	CHECK(converged_equal_speed && hw_members_lag[0] == 0x0001
+	      && HTONS(last_tx[0].actor.key) != HTONS(last_tx[1].actor.key),
+	      "T19 speed eligibility: mismatched link drains and advertises another key");
+	hw_link_class[0] = 0;
+	seconds(1);
+	CHECK(hw_members_lag[0] == 0, "T20 failover: link loss removes the failed member");
+
+	/* T21: active-fast cadence is one second and short expiry is three seconds;
+	 * these calls represent the fixed 1 Hz firmware hook, not main-loop spins. */
+	hw_link_class[0] = hw_link_class[1] = 3;
+	lacp_lag_set(0, 0x0003);
+	int fast_before = tx_count[0];
+	seconds(1);
+	CHECK(tx_count[0] == fast_before + 1
+	      && LACP_FAST_PERIODIC == 1 && LACP_SHORT_TIMEOUT == 3,
+	      "T21 timers: active-fast sends at 1 s with a 3 s short timeout");
+	partner_frame(0, SYS_A, P_ACT|P_AGG|P_SYNC, 1); /* peer asks for slow TX */
+	seconds(2);
+	int current_before_short_expiry = lacp_rx_state[0] == LACP_RX_CURRENT;
+	seconds(1);
+	CHECK(current_before_short_expiry && lacp_rx_state[0] == LACP_RX_DEFAULTED,
+	      "T21b timers: our fast preference expires a slow-requesting peer at 3 s");
+
+	/* T22: a PVID change deletes the two entries this module installed and
+	 * replaces them with the one now required by both candidates. */
+	hw_pvid[0] = hw_pvid[1] = 30;
+	hw_writes_reset();
+	lacp_fdb_refresh();
+	CHECK(hw_tbl_ops == 3 && !(hw_last_write[1].v[0] & 0x20),
+	      "T22 PVID refresh: stale CPU entries removed and current VLAN installed");
 
 	printf("\n%s (%d failure%s)\n", failures ? "SANDBOX: FAILURES" : "SANDBOX: ALL PASS",
 	       failures, failures == 1 ? "" : "s");

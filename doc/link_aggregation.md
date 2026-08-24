@@ -49,13 +49,22 @@ void port_lag_hash_set(__xdata uint8_t lag, __xdata uint8_t hash_bits) __banked;
 For testing the following commands are provided on the serial console:
 ```
 > lag <LAG-ID> [p1] [p2]...
-  Create or set a LAG. Trunk-ID is 1 or 2. Ports are physical ports
+  Create or set a static LAG. LAG-ID is 1 through 4. Ports are physical ports
   If only the LAG-ID is given but no members, the LAG is deleted
+
+> lag <LAG-ID> lacp [p1] [p2]...
+  Create an active LACP group with the listed candidate ports
+
+> lag <LAG-ID> lacp off
+  Disable LACP for this group
+
+> lacp show
+  Show the partner, receive state and active hardware members
 
 > lag show
   Shows information on all 4 lags
 
-> laghash 0 [hash1] [hash2]...
+> laghash <LAG-ID> [hash1] [hash2]...
   Uses the given packet properties when hashing the packet to select the link
   Names for the hashes are spa, smac, dmac, sip, dip, sport, dport
 ```
@@ -71,8 +80,30 @@ can be edited by clicking on the port-images to include that port or exclude it 
 When pressing on the Create/Update button, the LAG will be automatically created if not yet done, or
 updated. If a lage is updated to not having any members, then it is effectively deleted.
 
-All LAGs are created with the default hash-function (see above). This currently cannot be changed
-from the Web.
+The mode and hash function can be selected independently for each group. In
+LACP mode the selected ports are administrative candidates; the status area
+shows which synchronized links are currently collecting and distributing.
+Ports already assigned to another static or LACP group cannot be selected.
+
+## LACP with a UniFi switch
+
+UniFi supports dynamic LACP rather than a static LAG. Configure the matching
+UniFi ports as one aggregate, select **LACP** on this switch, select the same
+physical ports, and press **Update / Create**. For example, the serial-console
+equivalent for RJ45 ports 1 and 2 is:
+
+```
+lag 1 lacp 1 2
+laghash 1 smac dmac sip dip sport dport
+```
+
+All candidate links must be full duplex and negotiate the same speed. The
+firmware advertises a different operational key for a different link speed and
+will not place an ineligible link in the hardware trunk. It transmits active
+LACP at the standard fast cadence (one second) and expires a silent fast
+partner after three seconds. See UniFi's
+[Port Aggregation FAQ](https://help.ui.com/hc/en-us/articles/360007279753-Port-Aggregation-FAQs)
+for configuration and platform restrictions.
 
 ## A Test using a single Linux Desktop
 The following is a simple test using 2 RTL 2.5 GBit switches with at least 1 SFP+-port each. You
@@ -248,10 +279,8 @@ delivers with no egress on any port.
 
 Lookups are IVL on this chip, so an entry made for VID 0 is never matched and one
 entry is needed per PVID among the candidate ports, since untagged LACPDUs
-classify into the ingress port's PVID. Entries for stale VIDs are left behind,
-which is harmless because they only steer slow-protocol frames to the CPU, and
-the lookup table is volatile so a reboot clears them. Changing a port's PVID
-after LACP is configured needs `lacp off` then `lacp on` to refresh them.
+classify into the ingress port's PVID. The module tracks the entries it installs
+and replaces them whenever membership or a candidate port's PVID changes.
 
 The entry itself is written through the same SMI layout as any L2 multicast
 entry:
@@ -268,9 +297,10 @@ carries only the address, the VID and the IVL flag, and DATA_IN_C is a constant
 
 ## LACP: what the implementation leaves out
 
-The four state machines of Clause 43 are present in simplified form. Mux control
-is coupled rather than independent, one partner system is elected per LAG, and
-there are no churn detection machines.
+The receive, periodic-transmit, selection and mux behavior is implemented with
+coupled mux control. One partner system and key is elected per LAG; churn
+detection is not implemented. Incoming frames are accepted only after their
+Slow Protocol EtherType, subtype, version, size and required TLVs are validated.
 
 One interoperability rule is worth stating because getting it wrong is silent.
 The Partner block of an outgoing PDU has to echo the peer's own actor identity
