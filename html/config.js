@@ -64,7 +64,7 @@ const conf_overwrite = [
   /^eee\b/,
   /^mirror\b/,
   /^lag\s+\d+\b/,
-  /^laghash\b/,
+  /^laghash\s+\d+\b/,
   /^isolate\s+\d{1,2}\b/,
   /^stp\s+(prio|hello|maxage|fwd|txhold|version)\b/,
   /^stp\s+port\s+\d{1,2}\s+(edge|cost|prio|guard|filter|p2p)\b/,
@@ -136,4 +136,19 @@ async function fetchCmdLog() {
     console.error("Error: ", err);
     return "";
   }
+}
+
+function verifyConfigLines(savedText, expectedText) {
+  if (typeof savedText !== "string" || !savedText.trim()) return false;
+  const savedLines = new Set(
+    savedText.split(/\r\n|\n/).map(l => l.trim().replace(/\s+/g, ' ')).filter(Boolean)
+  );
+  const expectedLines = (typeof expectedText === "string" ? expectedText : "")
+    .split(/\r\n|\n/)
+    .map(l => l.trim().replace(/\s+/g, ' '))
+    .filter(Boolean);
+  for (const line of expectedLines) {
+    if (!savedLines.has(line)) return false;
+  }
+  return true;
 }

@@ -1,3 +1,13 @@
-ip 192.168.10.247
-gw 192.168.10.1
+ip 192.168.2.85
+gw 192.168.2.1
 netmask 255.255.255.0
+vlan 1 1 2 3 4 5 6
+vlan 10 1t 2t 3t 4t 5t 6t
+pvid 1 1
+pvid 2 1
+pvid 3 1
+pvid 4 1
+pvid 5 1
+pvid 6 1
+ingress a
+lag 1 lacp 1 2

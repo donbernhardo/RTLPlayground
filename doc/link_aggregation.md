@@ -85,6 +85,25 @@ LACP mode the selected ports are administrative candidates; the status area
 shows which synchronized links are currently collecting and distributing.
 Ports already assigned to another static or LACP group cannot be selected.
 
+### Saving the configuration
+
+**Update / Create** applies a LAG to the running configuration. It does not by
+itself make the change survive a reboot. **Save Settings to Flash**
+on the System page merges the running command history into the startup
+configuration. For example, an LACP group using ports 1 and 2 leaves
+these commands in the startup configuration:
+
+```
+lag 1 lacp 1 2
+laghash 1 smac dmac sip dip sport dport
+```
+
+The web configuration save performs readback verification against flash to
+ensure that the commands have persisted before clearing the running command
+log. You can also view or edit the startup configuration directly on the
+System page.
+
+
 ## LACP with a UniFi switch
 
 UniFi supports dynamic LACP rather than a static LAG. Configure the matching

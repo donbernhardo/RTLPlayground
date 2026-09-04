@@ -71,51 +71,66 @@ async function hostSub() {
 
 
 async function sendConfig(c) {
-  if (isSaving) return;
+  if (isSaving) return false;
   isSaving = true;
   clearInterval(systemInterval);
   const form = new FormData();
   form.append("MAX_FILE_SIZE", "4096");
   form.append("configuration", new Blob([c], {type: "application/octet-stream"}), "config.txt");
+  let writeSuccess = false;
   try {
     const response = await fetch('/config', {
       method: 'POST',
       body: form
     });
-    console.log('Completed!', response);
+    if (!response.ok) {
+      console.error('Config upload failed with status:', response.status);
+      alert((typeof t === "function" ? t('sys_save_failed') : "") || 'Failed to save configuration to Flash!');
+      return false;
+    }
+    console.log('Upload completed, verifying persistence...');
+    const readback = await fetchConfig();
+    if (!verifyConfigLines(readback, c)) {
+      console.error('Verification failed: readback config does not match expected configuration');
+      alert((typeof t === "function" ? t('sys_verify_failed') : "") || 'Configuration save verification failed!');
+      return false;
+    }
+    writeSuccess = true;
     try {
       await fetch('/cmd_log_clear', { method: 'GET' });
-    } catch(e) {}
+    } catch(e) {
+      console.error('Failed to clear command log:', e);
+    }
+    alert((typeof t === "function" ? t('sys_save_success') : "") || 'Settings saved to Flash successfully!');
   } catch(err) {
-    console.error(`Error: ${err}`);
+    console.error(`Error saving config: ${err}`);
+    alert((typeof t === "function" ? t('sys_save_failed') : "") || 'Failed to save configuration to Flash!');
   } finally {
     isSaving = false;
     systemInterval = setInterval(fetchIP, 1000);
   }
+  return writeSuccess;
 }
-
 
 async function flashSave() {
   configuration = [];
   const savedConfig = await fetchConfig();
+  if (savedConfig === undefined) {
+    alert((typeof t === "function" ? t('sys_save_failed') : "") || 'Failed to read current configuration!');
+    return false;
+  }
   const cmdLog = await fetchCmdLog();
   if (savedConfig) parseConf(savedConfig);
   if (cmdLog) parseConf(cmdLog);
   const body = configuration.join('\n') + '\n';
   console.log("CONFIGURATION to save: ", body);
-  await sendConfig(body);
+  return await sendConfig(body);
 }
 
 async function flashStartupSave() {
   var configContent = document.getElementById("config_display").value;
   console.log("CONFIGURATION to save: ", configContent);
-  sendConfig(configContent);
-  // Clear the command log 1 second after initiating the config save
-  setTimeout(() => {
-    fetch('/cmd_log_clear', { method: 'GET' })
-      .then(response => console.log('Command log cleared', response))
-      .catch(err => console.error('Error clearing command log:', err));
-  }, 1000);
+  return await sendConfig(configContent);
 }
 
 function clearConfig() {
